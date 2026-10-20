@@ -1,0 +1,33 @@
+name = "fleet-digest"
+main = "src/worker.js"
+compatibility_date = "2026-10-01"
+workers_dev = false
+
+# Just after Toronto midnight year-round (05:15 UTC covers EST;
+# during EDT it fires at 01:15 local, still reporting the completed
+# Toronto day — the window math is timezone-exact either way).
+[triggers]
+crons = ["15 5 * * *"]
+
+# The three landing waitlists: read + expired-pending cleanup only.
+[[d1_databases]]
+binding = "PL_DB"
+database_name = "playlist-waitlist"
+database_id = "d5da0a68-7615-4c02-b2dc-c1c31a776ebc"
+
+[[d1_databases]]
+binding = "PW_DB"
+database_name = "powerful-waitlist"
+database_id = "bfb18381-15ea-47a1-9a2f-79c10f4a5723"
+
+[[d1_databases]]
+binding = "AG_DB"
+database_name = "api-gripe-waitlist"
+database_id = "d38efcd6-ccde-4cf9-9143-1c31ae430c14"
+
+[[kv_namespaces]]
+binding = "AW_KV"
+id = "8537674cca544de19d7d736eed40115d"
+
+[[send_email]]
+name = "EMAIL"

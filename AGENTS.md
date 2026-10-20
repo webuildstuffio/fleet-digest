@@ -1,0 +1,24 @@
+# fleet-digest — agent notes
+
+Nightly fleet waitlist digest Worker (cron + token-gated manual
+`/run`). One file: `src/worker.js`; tests in `src/worker.test.js`
+(`bun test`). No test suite beyond that; no build step.
+
+Non-negotiables:
+
+- The digest covers the **America/Toronto** day, computed with the
+  timezone-exact helpers in worker.js (DST-tested). D1 timestamps
+  are UTC strings; never compare them against local dates directly.
+- The scheduled run sends **only when the day had ≥1 new confirmed
+  signup**. Manual `/run` always sends (proof path) and requires
+  the `DIGEST_RUN_TOKEN` bearer secret.
+- The only D1 write is deleting expired `pending` rows; the only
+  KV access is reads. Recipient is fixed:
+  `support@webuildstuff.io`; sender `digest@webuildstuff.io`.
+- This Worker deliberately does NOT live in repo-review — a digest
+  there was killed by the owner in 2026-10 (digest issues kept
+  filing). Do not move it, and do not add per-signup alerting back
+  to the landing Workers: subscriber mail is double opt-in via
+  their `mail.js` kit; owner visibility is this digest.
+- Deploys are manual wrangler (`bunx wrangler deploy`); verify the
+  serving version + cron + workers.dev-disabled via the API after.
