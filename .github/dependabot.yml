@@ -1,0 +1,69 @@
+# webuildstuffio org standard — monthly, grouped, bun-first.
+# Ecosystems are this repo's actual ones: bun (root package.json
+# + bun.lock; wrangler is the only devDependency) and
+# github-actions (the vendored security-scan workflow).
+# Policy: 5-day cooldown on EVERY entry.
+# NOTE: no versioning-strategy on the bun entry (org standard).
+# NOTE: dependency-type omitted = includes all types (dev +
+# prod). "all" is NOT a valid value — Dependabot rejects it.
+# NOTE: schedule.day is omitted — GitHub ignores it with
+# interval: "monthly" (monthly runs on the 1st).
+version: 2
+updates:
+  - package-ecosystem: "bun"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+      time: "05:00"
+    cooldown:
+      default-days: 5
+    open-pull-requests-limit: 10
+    rebase-strategy: "auto"
+    groups:
+      all-dependencies:
+        update-types:
+          - "minor"
+          - "patch"
+        patterns:
+          - "*"
+      major-updates:
+        update-types:
+          - "major"
+        patterns:
+          - "*"
+    labels:
+      - "dependencies"
+      - "bun"
+      - "monthly-update"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+      time: "05:00"
+    cooldown:
+      default-days: 5
+    rebase-strategy: "auto"
+    open-pull-requests-limit: 10
+    groups:
+      actions-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+        patterns:
+          - "*"
+      actions-major:
+        update-types:
+          - "major"
+        patterns:
+          - "*"
+    labels:
+      - "dependencies"
+      - "github-actions"
+      - "monthly-update"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
