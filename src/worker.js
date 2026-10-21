@@ -155,9 +155,90 @@ export function renderDigest(dayStr, sections) {
     }
     textParts.push("");
   }
-  textParts.push("Pending signups expire 48 h after the confirm email if never clicked.");
-  htmlParts.push(`<p style="color:#777;font-size:13px;margin-top:24px">Pending signups expire 48 h after the confirm email if never clicked. Sent by the fleet-digest Worker.</p></div>`);
+  textParts.push("Pending signups expire 72 h after the confirm email if never clicked.");
+  htmlParts.push(`<p style="color:#777;font-size:13px;margin-top:24px">Pending signups expire 72 h after the confirm email if never clicked. Sent by the fleet-digest Worker.</p></div>`);
   return { subject, text: textParts.join("\n"), html: htmlParts.join("\n"), total };
+}
+
+// ── Weeks ──────────────────────────────────────────────────────────
+// A digest week is the 7 Toronto days ending on a given day (the
+// Monday cron reports the week that ended Sunday).
+export function weekDays(endDayStr) {
+  const days = [];
+  for (let i = 6; i >= 0; i--) days.push(addDays(endDayStr, -i));
+  return days;
+}
+
+// Merge 7 daily section-lists into one week view: confirmed lists
+// concatenate in day order; pending is the latest day's snapshot;
+// cleaned sums (each day's own cleanup, reported once).
+export function mergeSections(perDaySections) {
+  return SITES.map((site, i) => {
+    const days = perDaySections.map((sections) => sections[i]);
+    return {
+      site,
+      confirmed: days.flatMap((d) => d.confirmed),
+      pending: days.length ? days[days.length - 1].pending : 0,
+      cleaned: days.reduce((n, d) => n + (d.cleaned || 0), 0),
+    };
+  });
+}
+
+export function renderWeekly(startDay, endDay, sections) {
+  const total = sections.reduce((n, s) => n + s.confirmed.length, 0);
+  const totalPending = sections.reduce((n, s) => n + s.pending, 0);
+  const fmtDay = (d) => new Date(`${d}T12:00:00Z`).toLocaleDateString("en-CA", {
+    timeZone: "America/Toronto", month: "long", day: "numeric", year: "numeric",
+  });
+  const range = `${fmtDay(startDay)} – ${fmtDay(endDay)}`;
+  const subject = `Fleet signups — week of ${startDay}: ${total} new confirmed`;
+  const textParts = [`Fleet waitlist weekly summary — ${range} (America/Toronto)`, ""];
+  const htmlParts = [
+    `<div style="font-family:-apple-system,Helvetica,Arial,sans-serif;max-width:560px;color:#111">`,
+    `<h1 style="font-size:20px">Fleet waitlist weekly summary</h1>`,
+    `<p style="color:#555">${range} (America/Toronto) — <strong>${total} new confirmed</strong> across ${sections.length} sites, ${totalPending} currently pending confirmation.</p>`,
+  ];
+  for (const s of sections) {
+    textParts.push(`${s.site.name} — ${s.confirmed.length} new this week, ${s.pending} pending`);
+    htmlParts.push(`<h2 style="font-size:16px;margin-top:24px">${esc(s.site.name)} — ${s.confirmed.length} new · ${s.pending} pending</h2>`);
+    if (s.confirmed.length) {
+      textParts.push(...s.confirmed.map((c) => `  ${c.email}${c.position ? ` (#${c.position})` : ""}`));
+      htmlParts.push(`<ul>${s.confirmed.map((c) => `<li>${esc(c.email)}${c.position ? ` — #${c.position}` : ""}</li>`).join("")}</ul>`);
+    } else {
+      textParts.push("  (none)");
+      htmlParts.push(`<p style="color:#777">No new confirmed signups this week.</p>`);
+    }
+    textParts.push("");
+  }
+  textParts.push("Weekly rollup of the daily fleet digests; a week with no new confirmed signups sends nothing.");
+  htmlParts.push(`<p style="color:#777;font-size:13px;margin-top:24px">Weekly rollup of the daily fleet digests; a week with no new confirmed signups sends nothing. Sent by the fleet-digest Worker.</p></div>`);
+  return { subject, text: textParts.join("\n"), html: htmlParts.join("\n"), total };
+}
+
+async function runWeekly(env, endDayStr, { alwaysSend = false } = {}) {
+  const days = weekDays(endDayStr);
+  const perDay = [];
+  for (const d of days) perDay.push(await collect(env, d));
+  const sections = mergeSections(perDay);
+  const digest = renderWeekly(days[0], endDayStr, sections);
+  let sent = false;
+  if ((digest.total > 0 || alwaysSend) && env.EMAIL) {
+    await env.EMAIL.send({
+      from: { email: "digest@webuildstuff.io", name: "Fleet Digest" },
+      to: "support@webuildstuff.io",
+      subject: digest.subject,
+      html: digest.html,
+      text: digest.text,
+    });
+    sent = true;
+  }
+  return {
+    mode: "weekly",
+    week: `${days[0]}..${endDayStr}`,
+    total: digest.total,
+    sent,
+    sites: sections.map((s) => ({ site: s.site.name, confirmed: s.confirmed.length, pending: s.pending })),
+  };
 }
 
 // ── Runs ───────────────────────────────────────────────────────────
@@ -190,7 +271,12 @@ export default {
   // reporting the Toronto day that just completed.
   async scheduled(event, env, ctx) {
     const yesterday = addDays(torontoToday(Date.parse(event.scheduledTime)), -1);
-    ctx.waitUntil(runDigest(env, yesterday).then(
+    // The Monday cron additionally reports the completed Toronto
+    // week (Mon–Sun) as a rollup — only when the week had signups.
+    const job = event.cron === "15 5 * * 1"
+      ? runWeekly(env, yesterday)
+      : runDigest(env, yesterday);
+    ctx.waitUntil(job.then(
       (r) => console.log("fleet-digest", JSON.stringify(r)),
       (err) => console.error("fleet-digest failed", err && err.message),
     ));
@@ -211,6 +297,10 @@ export default {
         ? torontoToday()
         : /^\d{4}-\d{2}-\d{2}$/.test(dayParam) ? dayParam : null;
       if (!day) return new Response("bad day\n", { status: 400 });
+      if (url.searchParams.get("mode") === "weekly") {
+        const endDay = dayParam ? day : addDays(torontoToday(), -1);
+        return Response.json(await runWeekly(env, endDay, { alwaysSend: true }));
+      }
       const result = await runDigest(env, day, { alwaysSend: true });
       return Response.json(result);
     }

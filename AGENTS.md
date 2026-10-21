@@ -1,7 +1,7 @@
 # fleet-digest — agent notes
 
-Nightly fleet waitlist digest Worker (cron + token-gated manual
-`/run`). One file: `src/worker.js`; tests in `src/worker.test.js`
+Fleet waitlist digest Worker (nightly cron + Monday weekly
+rollup cron, token-gated manual `/run`). One file: `src/worker.js`; tests in `src/worker.test.js`
 (`bun test`). No test suite beyond that; no build step.
 
 Non-negotiables:
@@ -9,8 +9,10 @@ Non-negotiables:
 - The digest covers the **America/Toronto** day, computed with the
   timezone-exact helpers in worker.js (DST-tested). D1 timestamps
   are UTC strings; never compare them against local dates directly.
-- The scheduled run sends **only when the day had ≥1 new confirmed
-  signup**. Manual `/run` always sends (proof path) and requires
+- The scheduled runs send **only when the period had ≥1 new
+  confirmed signup** (day for the nightly, Mon–Sun Toronto week
+  for the Monday rollup). Manual `/run` always sends (proof path;
+  `?mode=weekly&day=<week-end>` for a weekly) and requires
   the `DIGEST_RUN_TOKEN` bearer secret.
 - The only D1 write is deleting expired `pending` rows; the only
   KV access is reads. Recipient is fixed:

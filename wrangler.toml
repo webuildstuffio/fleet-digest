@@ -6,8 +6,10 @@ workers_dev = false
 # Just after Toronto midnight year-round (05:15 UTC covers EST;
 # during EDT it fires at 01:15 local, still reporting the completed
 # Toronto day — the window math is timezone-exact either way).
+# The Monday run (15 5 * * 1) additionally sends a weekly rollup of
+# the completed Toronto week (Mon–Sun) — only when it had signups.
 [triggers]
-crons = ["15 5 * * *"]
+crons = ["15 5 * * *", "15 5 * * 1"]
 
 # The three landing waitlists: read + expired-pending cleanup only.
 [[d1_databases]]
