@@ -33,10 +33,15 @@
 #   the raw OSV severity[].score is a CVSS *vector* string, not
 #   a number, so parsing it with tonumber classifies everything
 #   "unknown" and the HIGH/CRITICAL gate never fires.
-#   (3) the osv step fails closed on operational errors (exit
-#   codes per the osv-scanner return-code table: 0 clean, 1
-#   vulns found, 128 no packages — normalized to an empty
-#   report — anything else is an error, not a clean scan).
+#   (3) the scanner steps fail closed on operational errors:
+#   osv per its return-code table (0 clean, 1 vulns found, 128
+#   no packages — normalized to an empty report — anything
+#   else is an error, not a clean scan); Betterleaks and Trivy
+#   likewise fail the step on a non-zero exit instead of
+#   letting a missing report be normalized into a clean one.
+#   (4) the deep gate also counts Trivy's HIGH/CRITICAL secret
+#   results, not only its vulnerabilities — Trivy's secret
+#   ruleset is not identical to Betterleaks'.
 #
 # Tools (checksum-verified release downloads, exact pins):
 #   Betterleaks 1.9.0, osv-scanner 2.6.0, Trivy 0.74.0
@@ -196,17 +201,27 @@ jobs:
           start=$SECONDS
           BASE="${{ steps.scope.outputs.base }}"
           HEAD_SHA="${{ steps.scope.outputs.head }}"
+          # --exit-code 0 makes "leaks found" exit 0, so any
+          # non-zero exit here is an operational error (bad
+          # range, config, runtime) — fail closed rather than
+          # normalizing a missing report into a clean scan.
+          blrc=0
           if [ "${{ steps.scope.outputs.deep }}" != "true" ] \
             && [ -n "$BASE" ] \
             && git cat-file -e "$BASE" 2>/dev/null; then
             betterleaks git --log-opts "$BASE..$HEAD_SHA" \
               --report-format json \
               --report-path /tmp/betterleaks.json --exit-code 0 \
-              --redact=100 . 2>/dev/null || true
+              --redact=100 . 2>/tmp/betterleaks.err || blrc=$?
           else
             betterleaks git --report-format json \
               --report-path /tmp/betterleaks.json --exit-code 0 \
-              --redact=100 . 2>/dev/null || true
+              --redact=100 . 2>/tmp/betterleaks.err || blrc=$?
+          fi
+          if [ "$blrc" -ne 0 ]; then
+            echo "::error::betterleaks failed (exit $blrc):"
+            cat /tmp/betterleaks.err || true
+            exit 1
           fi
           [ -f /tmp/betterleaks.json ] \
             || echo '[]' > /tmp/betterleaks.json
@@ -320,9 +335,18 @@ jobs:
           set -uo pipefail
           export TRIVY_CACHE_DIR="$TOOLS_DIR/.trivy-cache"
           start=$SECONDS
+          # Trivy exits 0 with findings (no --exit-code set), so
+          # a non-zero exit is operational (DB, config, runtime)
+          # — fail closed instead of fabricating an empty report.
+          trc=0
           trivy fs --scanners vuln,secret,license \
             --format json --output /tmp/trivy.json . \
-            2>/dev/null || true
+            2>/tmp/trivy.err || trc=$?
+          if [ "$trc" -ne 0 ]; then
+            echo "::error::trivy failed (exit $trc):"
+            cat /tmp/trivy.err || true
+            exit 1
+          fi
           [ -f /tmp/trivy.json ] || echo '{}' > /tmp/trivy.json
           {
             echo "duration=$((SECONDS - start))"
@@ -333,6 +357,11 @@ jobs:
             echo "critical=$(jq \
               '[.Results[]?.Vulnerabilities[]?
                 | select(.Severity == "CRITICAL")] | length' \
+              /tmp/trivy.json)"
+            echo "secrets=$(jq \
+              '[.Results[]?.Secrets[]?
+                | select(.Severity == "HIGH"
+                  or .Severity == "CRITICAL")] | length' \
               /tmp/trivy.json)"
           } >> "$GITHUB_OUTPUT"
 
@@ -358,7 +387,9 @@ jobs:
             if [ "${{ steps.scope.outputs.deep }}" = "true" ]; then
               echo "| trivy (deep) | \
                 ${{ steps.trivy.outputs.high }} high, \
-                ${{ steps.trivy.outputs.critical }} critical | n/a | \
+                ${{ steps.trivy.outputs.critical }} critical, \
+                ${{ steps.trivy.outputs.secrets }} high/critical \
+                secrets | n/a | \
                 ${{ steps.trivy.outputs.duration }}s |"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
@@ -389,7 +420,8 @@ jobs:
             (steps.osv.outputs.high > 0 ||
              steps.osv.outputs.critical > 0 ||
              steps.trivy.outputs.high > 0 ||
-             steps.trivy.outputs.critical > 0)))
+             steps.trivy.outputs.critical > 0 ||
+             steps.trivy.outputs.secrets > 0)))
         run: |
           echo "Security scan findings (must-be-clean):"
           echo "  betterleaks=${{ steps.betterleaks.outputs.total }}"
@@ -398,5 +430,6 @@ jobs:
           echo "  osv head: ${{ steps.osv.outputs.high }} high / \
             ${{ steps.osv.outputs.critical }} critical"
           echo "  trivy: ${{ steps.trivy.outputs.high }} high / \
-            ${{ steps.trivy.outputs.critical }} critical"
+            ${{ steps.trivy.outputs.critical }} critical / \
+            ${{ steps.trivy.outputs.secrets }} high/critical secrets"
           exit 1
