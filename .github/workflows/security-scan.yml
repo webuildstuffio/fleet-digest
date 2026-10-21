@@ -1,0 +1,342 @@
+# Vendored security scan — do NOT replace with a `uses:` caller.
+#
+# This repo is PUBLIC and the fleet security-scan reusable lives
+# in the PRIVATE webuildstuffio/repo-review repo. Public repos
+# cannot call private reusable workflows (GitHub 422), so the
+# scan job is vendored here, self-contained. Step structure,
+# tool pins and scan logic follow the reusable at:
+#   repo-review .github/workflows/security-scan-reusable.yml
+#   @ 660e4d50f013090d88cd994d971e0d31e53c599e (v1.3.0)
+#
+# Deliberate differences from the reusable:
+# - No tier resolution: that machinery maps the fleet's private
+#   repos; this single public repo (a mail-sending Worker) is
+#   must-be-clean (any new Betterleaks finding, or any new
+#   HIGH/CRITICAL osv finding, fails the fast leg; the deep leg
+#   fails on any HIGH/CRITICAL Trivy finding too).
+# - No dashboard ingest step: ingest needs the private
+#   REPO_REVIEW_INGEST_TOKEN secret + REPO_REVIEW_URL variable
+#   for the repo-review dashboard. Results stay visible in the
+#   run summary + annotations instead.
+# - Sequential steps instead of the reusable's parallel group
+#   (same scanners, one less moving part in a vendored copy).
+#
+# Tools (checksum-verified release downloads, exact pins):
+#   Betterleaks 1.9.0, osv-scanner 2.6.0, Trivy 0.74.0
+
+name: security-scan
+'on':
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  schedule:
+    - cron: '0 9 * * 1' # Mondays 09:00 UTC — weekly deep scan
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  TOOLS_DIR: ${{ github.workspace }}/../security-tools
+  BETTERLEAKS_VERSION: "1.9.0"
+  OSV_SCANNER_VERSION: "2.6.0"
+  TRIVY_VERSION: "0.74.0"
+
+jobs:
+  scan:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.draft == false
+    runs-on: ubicloud-standard-2
+    timeout-minutes: 15
+    concurrency:
+      group: security-scan-vendored-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0 # history needed for range scan
+
+      - name: Determine base, head and scan kind
+        id: scope
+        run: |
+          set -euo pipefail
+          EVENT="${{ github.event_name }}"
+          if [ "$EVENT" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE=""
+            HEAD_SHA="${{ github.sha }}"
+          fi
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT" = "pull_request" ]; then
+            echo "deep=false" >> "$GITHUB_OUTPUT"
+            echo "kind=pr-fast" >> "$GITHUB_OUTPUT"
+          else
+            echo "deep=true" >> "$GITHUB_OUTPUT"
+            echo "kind=weekly-deep" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deep-scan skip-if-quiet gate
+        id: activity
+        if: steps.scope.outputs.deep == 'true'
+        run: |
+          if [ -z "$(git log --since='7 days ago' --format=%H)" ]; then
+            echo "active=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping deep scan: no commits in 7 days."
+          else
+            echo "active=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore tool cache
+        id: toolcache
+        if: steps.activity.outputs.active != 'false'
+        # actions/cache v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ github.workspace }}/../security-tools
+          key: >-
+            security-tools-v2-bl${{ env.BETTERLEAKS_VERSION }}-osv${{
+            env.OSV_SCANNER_VERSION }}-trivy${{ env.TRIVY_VERSION }}-${{
+            runner.os }}-${{ runner.arch }}
+          lookup-only: >-
+            ${{ steps.scope.outputs.deep != 'true' }}
+
+      - name: Install tools (cold cache only)
+        if: >-
+          steps.activity.outputs.active != 'false' &&
+          steps.toolcache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$TOOLS_DIR/bin"
+          dir="$(mktemp -d)"
+          trap 'rm -rf "$dir"' EXIT
+          arch="x64"
+          base="https://github.com/betterleaks/betterleaks/releases"
+          base="$base/download/v$BETTERLEAKS_VERSION"
+          bl_tgz="betterleaks_${BETTERLEAKS_VERSION}_linux_${arch}.tar.gz"
+          curl -fsSL --retry 3 -o "$dir/$bl_tgz" "$base/$bl_tgz"
+          curl -fsSL --retry 3 -o "$dir/bl-checksums.txt" \
+            "$base/checksums.txt"
+          (cd "$dir" && grep "linux_${arch}.tar.gz$" bl-checksums.txt \
+            | sha256sum --check -)
+          tar -xzf "$dir/$bl_tgz" -C "$TOOLS_DIR/bin" betterleaks
+          base="https://github.com/google/osv-scanner/releases"
+          base="$base/download/v$OSV_SCANNER_VERSION"
+          curl -fsSL --retry 3 -o "$dir/osv-scanner_linux_amd64" \
+            "$base/osv-scanner_linux_amd64"
+          curl -fsSL --retry 3 -o "$dir/osv-sums" \
+            "$base/osv-scanner_SHA256SUMS"
+          (cd "$dir" && grep "osv-scanner_linux_amd64$" osv-sums \
+            | sha256sum --check -)
+          install -m 755 "$dir/osv-scanner_linux_amd64" \
+            "$TOOLS_DIR/bin/osv-scanner"
+          base="https://github.com/aquasecurity/trivy/releases"
+          base="$base/download/v$TRIVY_VERSION"
+          trivy_tgz="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -fsSL --retry 3 -o "$dir/$trivy_tgz" "$base/$trivy_tgz"
+          curl -fsSL --retry 3 -o "$dir/trivy-checksums.txt" \
+            "$base/trivy_${TRIVY_VERSION}_checksums.txt"
+          (cd "$dir" && grep "Linux-64bit.tar.gz$" trivy-checksums.txt \
+            | sha256sum --check -)
+          tar -xzf "$dir/$trivy_tgz" -C "$TOOLS_DIR/bin" trivy
+          "$TOOLS_DIR/bin/betterleaks" version
+          "$TOOLS_DIR/bin/osv-scanner" --version
+
+      - name: Save tool cache (trusted deep runs only)
+        if: >-
+          steps.activity.outputs.active != 'false' &&
+          steps.toolcache.outputs.cache-hit != 'true' &&
+          steps.scope.outputs.deep == 'true' &&
+          github.ref ==
+            format('refs/heads/{0}',
+              github.event.repository.default_branch)
+        # actions/cache v6.1.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ github.workspace }}/../security-tools
+          key: ${{ steps.toolcache.outputs.cache-primary-key }}
+
+      - name: Add tools to PATH
+        if: steps.activity.outputs.active != 'false'
+        run: echo "$TOOLS_DIR/bin" >> "$GITHUB_PATH"
+
+      - name: Betterleaks secret scan (diff-only on fast path)
+        id: betterleaks
+        if: steps.activity.outputs.active != 'false'
+        run: |
+          set -uo pipefail
+          start=$SECONDS
+          BASE="${{ steps.scope.outputs.base }}"
+          HEAD_SHA="${{ steps.scope.outputs.head }}"
+          if [ "${{ steps.scope.outputs.deep }}" != "true" ] \
+            && [ -n "$BASE" ] \
+            && git cat-file -e "$BASE" 2>/dev/null; then
+            betterleaks git --log-opts "$BASE..$HEAD_SHA" \
+              --report-format json \
+              --report-path /tmp/betterleaks.json --exit-code 0 \
+              --redact=100 . 2>/dev/null || true
+          else
+            betterleaks git --report-format json \
+              --report-path /tmp/betterleaks.json --exit-code 0 \
+              --redact=100 . 2>/dev/null || true
+          fi
+          [ -f /tmp/betterleaks.json ] \
+            || echo '[]' > /tmp/betterleaks.json
+          echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+          total=$(jq 'if type == "array" then length else 0 end' \
+            /tmp/betterleaks.json 2>/dev/null || echo 0)
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+          echo "new=$total" >> "$GITHUB_OUTPUT"
+          echo "betterleaks: total=$total new=$total"
+
+      - name: osv-scanner vulnerability scan
+        id: osv
+        if: steps.activity.outputs.active != 'false'
+        run: |
+          set -uo pipefail
+          start=$SECONDS
+          osv-scanner scan source -r . --format json \
+            --output-file /tmp/osv-head.json 2>/dev/null || true
+          [ -f /tmp/osv-head.json ] || echo '{"results":[]}' \
+            > /tmp/osv-head.json
+          BASE="${{ steps.scope.outputs.base }}"
+          if [ -n "$BASE" ] \
+            && [ "${{ steps.scope.outputs.deep }}" != "true" ]; then
+            git worktree add --detach /tmp/osv-base "$BASE" \
+              >/dev/null 2>&1
+            (cd /tmp/osv-base && osv-scanner scan source -r . \
+              --format json --output-file /tmp/osv-base.json \
+              2>/dev/null) || true
+            git worktree remove --force /tmp/osv-base
+            [ -f /tmp/osv-base.json ] || echo '{"results":[]}' \
+              > /tmp/osv-base.json
+          else
+            echo '{"results":[]}' > /tmp/osv-base.json
+          fi
+          extract() {
+            jq -r '
+              def cvss: ([.severity[]?
+                | select(.type | startswith("CVSS"))
+                | .score | tonumber?] | max // 0);
+              def sev: cvss as $s
+                | if $s >= 9 then "critical"
+                  elif $s >= 7 then "high"
+                  elif $s >= 4 then "medium"
+                  elif $s > 0 then "low"
+                  else "unknown" end;
+              .results[]?.packages[]?
+              | .package as $p
+              | .vulnerabilities[]?
+              | "\($p.ecosystem // "?")|\($p.name)|\($p.version)"
+                + " |\(.id)|\(sev)"' "$1" | sort -u
+          }
+          extract /tmp/osv-head.json > /tmp/osv-head.txt
+          extract /tmp/osv-base.json > /tmp/osv-base.txt
+          comm -23 /tmp/osv-head.txt /tmp/osv-base.txt \
+            > /tmp/osv-new.txt || true
+          count() { grep -c "|$1$" "$2" || true; }
+          {
+            echo "duration=$((SECONDS - start))"
+            echo "high=$(count high /tmp/osv-head.txt)"
+            echo "critical=$(count critical /tmp/osv-head.txt)"
+            echo "new_high=$(count high /tmp/osv-new.txt)"
+            echo "new_critical=$(count critical /tmp/osv-new.txt)"
+          } >> "$GITHUB_OUTPUT"
+          echo "osv: $(wc -l < /tmp/osv-new.txt) new vulns"
+
+      - name: Trivy deep scan (weekly only)
+        id: trivy
+        if: >-
+          steps.activity.outputs.active != 'false' &&
+          steps.scope.outputs.deep == 'true'
+        run: |
+          set -uo pipefail
+          export TRIVY_CACHE_DIR="$TOOLS_DIR/.trivy-cache"
+          start=$SECONDS
+          trivy fs --scanners vuln,secret,license \
+            --format json --output /tmp/trivy.json . \
+            2>/dev/null || true
+          [ -f /tmp/trivy.json ] || echo '{}' > /tmp/trivy.json
+          {
+            echo "duration=$((SECONDS - start))"
+            echo "high=$(jq \
+              '[.Results[]?.Vulnerabilities[]?
+                | select(.Severity == "HIGH")] | length' \
+              /tmp/trivy.json)"
+            echo "critical=$(jq \
+              '[.Results[]?.Vulnerabilities[]?
+                | select(.Severity == "CRITICAL")] | length' \
+              /tmp/trivy.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Scan summary
+        if: steps.activity.outputs.active != 'false'
+        run: |
+          {
+            echo "## Security scan (${{ steps.scope.outputs.kind }})"
+            echo "vendored (public repo; no private reusable call)"
+            echo ""
+            echo "| Scanner | Findings | New vs base | Time |"
+            echo "|---------|----------|-------------|------|"
+            echo "| betterleaks (secrets) | \
+              ${{ steps.betterleaks.outputs.total }} | \
+              ${{ steps.betterleaks.outputs.new }} | \
+              ${{ steps.betterleaks.outputs.duration }}s |"
+            echo "| osv-scanner (deps) | \
+              ${{ steps.osv.outputs.high }} high, \
+              ${{ steps.osv.outputs.critical }} critical | \
+              ${{ steps.osv.outputs.new_high }} high, \
+              ${{ steps.osv.outputs.new_critical }} critical | \
+              ${{ steps.osv.outputs.duration }}s |"
+            if [ "${{ steps.scope.outputs.deep }}" = "true" ]; then
+              echo "| trivy (deep) | \
+                ${{ steps.trivy.outputs.high }} high, \
+                ${{ steps.trivy.outputs.critical }} critical | n/a | \
+                ${{ steps.trivy.outputs.duration }}s |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          new_leaks=${{ steps.betterleaks.outputs.new }}
+          if [ "${new_leaks:-0}" -gt 0 ]; then
+            jq -r 'if type == "array" then
+                .[:20][] |
+                "::error file=\(.File)::betterleaks: " +
+                "\(.RuleID) finding (\((.Commit // "")[0:8]))"
+              else empty end' /tmp/betterleaks.json
+          fi
+          new_crit=${{ steps.osv.outputs.new_critical }}
+          new_high=${{ steps.osv.outputs.new_high }}
+          if [ "${new_crit:-0}" -gt 0 ] \
+            || [ "${new_high:-0}" -gt 0 ]; then
+            awk -F'|' '$5 ~ /^(high|critical)$/ \
+              {printf "::error::osv-scanner: new %s %s in %s@%s\n", \
+              $5, $4, $2, $3}' /tmp/osv-new.txt | head -20
+          fi
+
+      - name: Fail on findings
+        if: >-
+          steps.activity.outputs.active != 'false' &&
+          (steps.betterleaks.outputs.total > 0 ||
+           steps.osv.outputs.new_high > 0 ||
+           steps.osv.outputs.new_critical > 0 ||
+           (steps.scope.outputs.deep == 'true' &&
+            (steps.osv.outputs.high > 0 ||
+             steps.osv.outputs.critical > 0 ||
+             steps.trivy.outputs.high > 0 ||
+             steps.trivy.outputs.critical > 0)))
+        run: |
+          echo "Security scan findings (must-be-clean):"
+          echo "  betterleaks=${{ steps.betterleaks.outputs.total }}"
+          echo "  osv new: ${{ steps.osv.outputs.new_high }} high / \
+            ${{ steps.osv.outputs.new_critical }} critical"
+          echo "  osv head: ${{ steps.osv.outputs.high }} high / \
+            ${{ steps.osv.outputs.critical }} critical"
+          echo "  trivy: ${{ steps.trivy.outputs.high }} high / \
+            ${{ steps.trivy.outputs.critical }} critical"
+          exit 1
