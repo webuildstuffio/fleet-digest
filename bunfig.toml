@@ -1,0 +1,5 @@
+# Bun Security Configuration
+# Protects against npm/bun malware campaigns
+[install]
+# 5-day poison window: ignore package versions published less than 5 days ago
+minimumReleaseAge = 432000
