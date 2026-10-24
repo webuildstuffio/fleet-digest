@@ -17,7 +17,7 @@ Non-negotiables:
 - The only D1 write is deleting expired `pending` rows; the only
   KV access is reads. Recipient is fixed:
   `support@webuildstuff.io`; sender `digest@webuildstuff.io`.
-- This Worker deliberately does NOT live in repo-review — a digest
+- SUPERSEDED 2026-10-24: the owner ordered this Worker merged into repo-review (PR #404); the standalone repo is archived. (Was: this Worker deliberately does NOT live in repo-review — a digest
   there was killed by the owner in 2026-10 (digest issues kept
   filing). Do not move it, and do not add per-signup alerting back
   to the landing Workers: subscriber mail is double opt-in via

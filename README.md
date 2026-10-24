@@ -1,45 +1,19 @@
-# fleet-digest
+# fleet-digest — ARCHIVED, moved to repo-review
 
-One nightly email with the day's confirmed waitlist signups across
-the fleet's coming-soon sites — the replacement for per-signup
-owner alert emails (owner order 2026-10-21, alongside the double
-opt-in rollout).
+**This repo was merged into the repo tracker on 2026-10-24 (owner
+order) and archived.** Do not work here.
 
-## How it works
+The fleet waitlist digest Worker now lives at
+[`workers/fleet-digest/`](https://github.com/webuildstuffio/repo-review/tree/main/workers/fleet-digest)
+in **webuildstuffio/repo-review** — code, tests, wrangler config
+and the deploy flow all moved there (PR
+[repo-review#404](https://github.com/webuildstuffio/repo-review/pull/404)).
 
-- Cron `15 5 * * *` UTC — just after Toronto midnight year-round.
-  Each run reports the most recently completed **America/Toronto**
-  day: per site, the newly confirmed addresses + positions, how
-  many signups are still pending confirmation, and a fleet total.
-- Sources: the three landing D1s (`PL_DB` playlist.rest, `PW_DB`
-  powerful.build, `AG_DB` api.gripe — `status='confirmed'` rows by
-  `confirmed_at` in the window) and the anywrapped KV (`AW_KV` —
-  `wl:` records by their stored `ts`).
-- The run also deletes expired pendings from the D1s (unconfirmed
-  signups live 48 h); KV pendings expire by TTL on their own.
-- **Sent only when at least one new confirmed signup exists** —
-  quiet days send nothing. From `digest@webuildstuff.io` (domain
-  onboarded to Email Sending) to `support@webuildstuff.io`
-  (verified destination; routes to the owner's inbox).
+The deployed Worker is unaffected: same name (`fleet-digest`),
+same D1/KV/email bindings, same crons (`15 5 * * *` daily +
+`15 5 * * 1` Monday weekly, America/Toronto windows). Deploys now
+run from the repo-review copy.
 
-## Manual run
-
-`POST /run` with `Authorization: Bearer <DIGEST_RUN_TOKEN>`:
-
-- `?day=YYYY-MM-DD` — that Toronto day; `?day=today` or no param —
-  today so far. Manual runs always send (this is the proof path).
-
-## Deploy
-
-Manual, wrangler (canonical config is `wrangler.toml`):
-
-```sh
-bun install
-bun test
-bunx wrangler deploy
-bunx wrangler secret put DIGEST_RUN_TOKEN   # once
-```
-
-After any deploy, verify via the Workers API that the serving
-version is at 100%, the cron trigger exists, and workers.dev is
-disabled.
+Issues moved too: the one open issue (redundant-tests audit) was
+transferred to
+[repo-review#405](https://github.com/webuildstuffio/repo-review/issues/405).
